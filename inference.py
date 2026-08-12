@@ -6,10 +6,17 @@ does not import from the training scripts directory, so this folder can be
 deployed on its own).
 """
 
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+# Keep torch's intra-op thread pool small: on memory-constrained hosts
+# (e.g. Render's free 512MB instances) extra OpenMP worker threads add
+# allocator overhead for no real speedup on this tiny model.
+torch.set_num_threads(1)
+
 from PIL import Image
 from torchvision import transforms
 from transformers import ViTConfig, ViTForImageClassification
@@ -70,22 +77,31 @@ class CellClassifier:
         }
 
     @torch.no_grad()
-    def predict_batch(self, pil_images):
+    def predict_batch(self, pil_images, chunk_size=8):
+        # Processed in small chunks (rather than one giant stacked tensor)
+        # to keep peak memory bounded regardless of dataset size -- this
+        # matters on memory-constrained deployments (e.g. Render's free
+        # tier, 512MB RAM) where activation memory for a large batch can
+        # push the process over the limit.
         if not pil_images:
             return []
-        xs = torch.stack([_transform(im.convert("RGB")) for im in pil_images]).to(self.device)
-        logits = self.model(pixel_values=xs).logits
-        probs = torch.softmax(logits, dim=1).cpu().tolist()
         results = []
-        for p in probs:
-            pred_idx = int(max(range(len(p)), key=lambda i: p[i]))
-            results.append(
-                {
-                    "label": CLASSES[pred_idx],
-                    "confidence": p[pred_idx],
-                    "probs": {c: v for c, v in zip(CLASSES, p)},
-                }
-            )
+        for start in range(0, len(pil_images), chunk_size):
+            chunk = pil_images[start : start + chunk_size]
+            xs = torch.stack([_transform(im.convert("RGB")) for im in chunk]).to(self.device)
+            logits = self.model(pixel_values=xs).logits
+            probs = torch.softmax(logits, dim=1).cpu().tolist()
+            for p in probs:
+                pred_idx = int(max(range(len(p)), key=lambda i: p[i]))
+                results.append(
+                    {
+                        "label": CLASSES[pred_idx],
+                        "confidence": p[pred_idx],
+                        "probs": {c: v for c, v in zip(CLASSES, p)},
+                    }
+                )
+            del xs, logits
+        gc.collect()
         return results
 
 
